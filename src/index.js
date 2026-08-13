@@ -29,6 +29,7 @@ async function kimiRequest(env, body) {
       "content-type": "application/json",
       authorization: `Bearer ${env.MOONSHOT_API_KEY}`,
     },
+    signal: AbortSignal.timeout(45_000),
     body: JSON.stringify(body),
   });
   const data = await response.json();
@@ -99,8 +100,6 @@ async function runLiveScout(env) {
       };
     }
 
-    // K3 requires the complete assistant message, including reasoning_content/tool_calls,
-    // to be preserved unchanged in multi-turn tool use.
     messages.push(choice.message);
 
     for (const toolCall of choice.message?.tool_calls ?? []) {
@@ -124,8 +123,6 @@ async function runLiveScout(env) {
         args = {};
       }
 
-      // Kimi's built-in web-search executes when its generated arguments are
-      // returned as the matching tool result.
       messages.push({
         role: "tool",
         tool_call_id: toolCall.id,
