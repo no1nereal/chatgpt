@@ -79,11 +79,11 @@ async function runLiveScout(env) {
 
   for (let step = 0; step < 8; step++) {
     const data = await kimiRequest(env, {
-      model: "kimi-k3",
+      model: "kimi-k2.6",
       messages,
       tools,
-      max_completion_tokens: 12000,
-      reasoning_effort: "low",
+      max_tokens: 32768,
+      thinking: { type: "disabled" },
     });
 
     lastUsage = data.usage ?? lastUsage;
