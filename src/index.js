@@ -22,7 +22,7 @@ function isAuthorized(request, env) {
   return Boolean(env.CHAIRMAN_TOKEN && token && token === env.CHAIRMAN_TOKEN);
 }
 
-async function callKimi(env, messages, temperature = 0.2, maxTokens = 1000) {
+async function callKimi(env, messages, maxTokens = 1000) {
   const response = await fetch("https://api.moonshot.ai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -32,7 +32,6 @@ async function callKimi(env, messages, temperature = 0.2, maxTokens = 1000) {
     body: JSON.stringify({
       model: "kimi-k3",
       messages,
-      temperature,
       max_tokens: maxTokens,
     }),
   });
@@ -71,7 +70,7 @@ function cockpit() {
 </head>
 <body>
 <main>
-  <div class="eyebrow">private control surface · v0.2.0</div>
+  <div class="eyebrow">private control surface · v0.2.1</div>
   <h1>sefi foundry</h1>
   <p class="sub">the creature can think, but it still cannot spend money, contact people, or deploy products. chairman authorization is required for every paid Kimi call.</p>
 
@@ -129,7 +128,7 @@ export default {
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         foundry: "alive",
-        version: "0.2.0",
+        version: "0.2.1",
         deployment_source: "github",
         paid_actions_locked: true,
         capabilities: ["kimi_reasoning", "chairman_cockpit", "business_hypotheses"],
@@ -145,7 +144,7 @@ export default {
 
     if (url.pathname === "/chairman/ping") {
       if (!isAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
-      return json({ chairman: "recognized", foundry: "ready", version: "0.2.0" });
+      return json({ chairman: "recognized", foundry: "ready", version: "0.2.1" });
     }
 
     if (url.pathname === "/chairman/brain-test" && request.method === "POST") {
@@ -162,7 +161,7 @@ export default {
             role: "user",
             content: "Return exactly one short sentence confirming you understand that your current job is only to reason, not spend money, deploy products, contact people, or make external changes.",
           },
-        ], 0.1, 150);
+        ], 150);
 
         return json({
           foundry: "alive",
@@ -190,7 +189,7 @@ export default {
             role: "user",
             content: "Generate exactly 3 sharply different micro-SaaS business hypotheses. For each include: name, specific buyer, painful repetitive job, product behavior, likely self-serve price, why agents can operate it, biggest risk, and the single cheapest validation experiment. Rank them 1-3. Keep the response compact and practical.",
           },
-        ], 0.45, 1200);
+        ], 1200);
 
         return json({
           warning: "hypotheses only — not live-market validated yet",
