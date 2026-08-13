@@ -34,7 +34,8 @@ export default {
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         foundry: "alive",
-        version: "0.1.0",
+        version: "0.1.1",
+        deployment_source: "github",
         paid_actions_locked: true,
         kimi_secret_present: Boolean(env.MOONSHOT_API_KEY),
       });
