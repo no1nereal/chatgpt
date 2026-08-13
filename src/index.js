@@ -17,40 +17,73 @@ const html = (body) => new Response(body, {
   },
 });
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function isAuthorized(request, env) {
   const token = request.headers.get("x-chairman-token");
   return Boolean(env.CHAIRMAN_TOKEN && token && token === env.CHAIRMAN_TOKEN);
 }
 
-async function kimiRequest(env, body) {
-  const response = await fetch("https://api.moonshot.ai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.MOONSHOT_API_KEY}`,
-    },
-    signal: AbortSignal.timeout(45_000),
-    body: JSON.stringify(body),
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data?.error?.message || `Kimi API error ${response.status}`);
-  return data;
+function retryDelayMs(message) {
+  const match = String(message || "").match(/after\s+(\d+)\s+seconds?/i);
+  return Math.min(Math.max(Number(match?.[1] || 1), 1), 5) * 1000;
+}
+
+async function moonshotRequest(env, path, { method = "GET", body, timeoutMs = 45_000, retries = 4 } = {}) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const options = {
+        method,
+        headers: {
+          authorization: `Bearer ${env.MOONSHOT_API_KEY}`,
+          ...(body ? { "content-type": "application/json" } : {}),
+        },
+        signal: AbortSignal.timeout(timeoutMs),
+      };
+      if (body) options.body = JSON.stringify(body);
+
+      const response = await fetch(`https://api.moonshot.ai/v1${path}`, options);
+      const text = await response.text();
+      let data;
+      try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+
+      if (response.ok) return data;
+
+      const message = data?.error?.message || `Kimi API error ${response.status}`;
+      if (response.status === 429 && attempt < retries) {
+        await sleep(retryDelayMs(message));
+        continue;
+      }
+      throw new Error(message);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= retries || error?.name === "TimeoutError") break;
+      await sleep(1000);
+    }
+  }
+
+  throw lastError || new Error("Moonshot request failed");
 }
 
 async function callKimi(env, messages, { maxCompletionTokens = 6000, reasoningEffort = "low" } = {}) {
-  return kimiRequest(env, {
-    model: "kimi-k3",
-    messages,
-    max_completion_tokens: maxCompletionTokens,
-    reasoning_effort: reasoningEffort,
+  return moonshotRequest(env, "/chat/completions", {
+    method: "POST",
+    body: {
+      model: "kimi-k3",
+      messages,
+      max_completion_tokens: maxCompletionTokens,
+      reasoning_effort: reasoningEffort,
+    },
   });
 }
 
 async function runLiveScout(env) {
-  const tools = [{
-    type: "builtin_function",
-    function: { name: "$web_search" },
-  }];
+  const formulaUri = "moonshot/web-search:latest";
+  const toolDeclaration = await moonshotRequest(env, `/formulas/${formulaUri}/tools`);
+  const tools = toolDeclaration?.tools;
+  if (!Array.isArray(tools) || !tools.length) throw new Error("Kimi web-search tool declaration was empty");
 
   const messages = [
     {
@@ -61,7 +94,7 @@ async function runLiveScout(env) {
         "Your job is market discovery only: research the live web and identify self-serve digital products or micro-SaaS opportunities that could plausibly become mostly autonomous.",
         "The owner's target is eventually $10k-$20k monthly profit without sales calls, custom client work, inventory, regulated products, deception, spam, or gray-market tactics.",
         "Prefer boring painful repetitive jobs, existing buyer spend, obvious search intent, recurring or usage-based revenue, and products AI agents can build/support.",
-        "Use no more than FOUR web searches total. Seek evidence, not vibes. Do not claim validation beyond what sources support.",
+        "Use web search carefully and economically. Seek evidence, not vibes. Do not claim validation beyond what sources support.",
         "You cannot spend money, contact anyone, deploy anything, open accounts, or make external changes.",
       ].join(" "),
     },
@@ -70,7 +103,7 @@ async function runLiveScout(env) {
       content: [
         "Scout the live market. Search for concrete pain signals, buyer complaints, existing paid alternatives, pricing, and gaps.",
         "Return exactly 3 ranked opportunities. For each give: specific buyer; repetitive painful job; evidence observed on the live web; existing alternatives/prices when found; proposed tiny product; suggested self-serve pricing; autonomy fit; biggest risk; and cheapest validation test.",
-        "End with one winner and a short explanation of why it deserves the first build. Include source URLs or source names when available in your search output.",
+        "End with one winner and a short explanation of why it deserves the first build. Include source names or URLs when the search evidence provides them.",
       ].join(" "),
     },
   ];
@@ -78,61 +111,77 @@ async function runLiveScout(env) {
   let searchCalls = 0;
   let lastUsage = null;
 
-  for (let step = 0; step < 8; step++) {
-    const data = await kimiRequest(env, {
-      model: "kimi-k2.6",
-      messages,
-      tools,
-      max_tokens: 32768,
-      thinking: { type: "disabled" },
+  for (let step = 0; step < 6; step++) {
+    const data = await moonshotRequest(env, "/chat/completions", {
+      method: "POST",
+      body: {
+        model: "kimi-k3",
+        messages,
+        tools,
+        max_completion_tokens: 5000,
+        reasoning_effort: "low",
+      },
     });
 
     lastUsage = data.usage ?? lastUsage;
     const choice = data.choices?.[0];
     if (!choice) throw new Error("Kimi returned no choice");
 
-    if (choice.finish_reason !== "tool_calls") {
+    const assistantMessage = choice.message || {};
+    const toolCalls = assistantMessage.tool_calls || [];
+
+    if (!toolCalls.length) {
       return {
         model: data.model,
-        result: choice.message?.content ?? "",
+        result: assistantMessage.content ?? "",
         search_calls: searchCalls,
         usage: lastUsage,
       };
     }
 
-    messages.push(choice.message);
+    // Hard budget: no search is executed if this batch would exceed four total searches.
+    if (searchCalls + toolCalls.length > 4) {
+      throw new Error(`Scout safety cap: model requested ${toolCalls.length} searches with only ${4 - searchCalls} remaining`);
+    }
 
-    for (const toolCall of choice.message?.tool_calls ?? []) {
-      if (toolCall.function?.name !== "$web_search") {
-        messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          name: toolCall.function?.name || "unknown",
-          content: JSON.stringify({ error: "tool not allowed" }),
-        });
-        continue;
+    messages.push({
+      role: "assistant",
+      content: assistantMessage.content ?? null,
+      tool_calls: toolCalls,
+    });
+
+    for (const toolCall of toolCalls) {
+      const fn = toolCall?.function;
+      if (!fn || fn.name !== "web_search") {
+        throw new Error(`Scout attempted unsupported tool: ${fn?.name || "unknown"}`);
       }
+
+      const fiber = await moonshotRequest(env, `/formulas/${formulaUri}/fibers`, {
+        method: "POST",
+        body: {
+          name: fn.name,
+          arguments: fn.arguments,
+        },
+      });
+
+      if (fiber?.status && fiber.status !== "succeeded") {
+        throw new Error(`Kimi web search failed with status: ${fiber.status}`);
+      }
+
+      const context = fiber?.context || {};
+      const result = context.output || context.encrypted_output || "";
+      if (!result) throw new Error("Kimi web search returned no output");
 
       searchCalls += 1;
-      if (searchCalls > 4) throw new Error("Scout safety cap reached: more than 4 web searches requested");
-
-      let args;
-      try {
-        args = JSON.parse(toolCall.function.arguments || "{}");
-      } catch {
-        args = {};
-      }
-
       messages.push({
         role: "tool",
         tool_call_id: toolCall.id,
-        name: "$web_search",
-        content: JSON.stringify(args),
+        content: result,
       });
     }
   }
 
-  throw new Error("Scout stopped after 8 tool-loop steps");
+  throw new Error("Scout stopped after 6 model turns without a final answer");
 }
 
 function cockpit() {
@@ -165,9 +214,9 @@ function cockpit() {
 </head>
 <body>
 <main>
-  <div class="eyebrow">private control surface · v0.3.0</div>
+  <div class="eyebrow">private control surface · v0.3.2</div>
   <h1>sefi foundry</h1>
-  <p class="sub">the creature can now think and scout the live web. it still cannot spend ad money, contact people, deploy products, or touch payment accounts.</p>
+  <p class="sub">the creature can think and scout the live web through Kimi's official search tool. it still cannot spend money, contact people, deploy products, or touch payment accounts.</p>
 
   <section class="panel">
     <label for="token">chairman token — kept only in this open tab, never saved by this page</label>
@@ -183,7 +232,7 @@ function cockpit() {
   <section class="panel">
     <div class="safe">
       <span><span class="dot"></span>paid calls locked behind chairman token</span>
-      <span class="amber">live scout can incur Kimi token + web-search charges</span>
+      <span class="amber">scout has hard max 4 executed web searches</span>
     </div>
     <pre id="output">ready.</pre>
   </section>
@@ -225,10 +274,10 @@ export default {
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({
         foundry: "alive",
-        version: "0.3.0",
+        version: "0.3.2",
         deployment_source: "github",
         paid_actions_locked: true,
-        capabilities: ["kimi_reasoning", "chairman_cockpit", "business_hypotheses", "live_web_scout"],
+        capabilities: ["kimi_reasoning", "chairman_cockpit", "business_hypotheses", "official_formula_web_scout"],
         external_actions_enabled: false,
         live_search_enabled: true,
         scout_search_cap: 4,
@@ -241,7 +290,7 @@ export default {
 
     if (url.pathname === "/chairman/ping") {
       if (!isAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
-      return json({ chairman: "recognized", foundry: "ready", version: "0.3.0" });
+      return json({ chairman: "recognized", foundry: "ready", version: "0.3.2" });
     }
 
     if (url.pathname === "/chairman/brain-test" && request.method === "POST") {
